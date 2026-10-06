@@ -1,7 +1,7 @@
 # Predicting Stock Volatility
 **Project brief**: create an interpretable model for a quantitative trader that forecasts the next 30 seconds of a stock's realised volatility from high-frequency order book data. 
 
-**Result**: Ridge regression achieved the lowest forecast error, outperforming every time-series model.
+**Result**: Ridge regression achieved the lowest forecast error, outperforming EWMA, HAR-RV, GARCH family models (GARCH, EGARCH) and other regression models (OLS, WLS, Lasso).
 
 ## Approach
 - **Data:** second-by-second order book snapshots for one stock, split into 10-minute intervals and 30-second buckets. Missing seconds are forward-filled to preserve real price jumps.
