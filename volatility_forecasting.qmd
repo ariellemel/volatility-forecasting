@@ -1,0 +1,440 @@
+---
+title: "Predicting Future Volatility"
+author: "Arielle Melamed"
+format: html
+execute:
+  cache: true
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r libraries}
+library(tidyverse)
+library(rugarch)
+library(glmnet)
+```
+
+```{r config}
+USE_SUBSET <- FALSE
+SUBSET_SIZE <- 100
+```
+
+```{r load-data}
+stock1 <- read.csv("data/stock_1.csv")
+
+stock1 <- stock1 %>%
+  group_by(time_id) %>%
+  complete(seconds_in_bucket = 0:599) %>%
+  arrange(time_id, seconds_in_bucket) %>%
+  fill(bid_price1, ask_price1, bid_size1, ask_size1,
+       bid_price2, ask_price2, bid_size2, ask_size2,
+       .direction = "down") %>%
+  ungroup() %>%
+  mutate(
+    WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1),
+    BAS = ask_price1 / bid_price1 - 1,
+    num_order = bid_size1 + ask_size1 + bid_size2 + ask_size2
+  )
+
+all_time_IDs <- unique(stock1$time_id)
+
+if (USE_SUBSET) {
+  set.seed(40)
+  time_IDs <- sample(all_time_IDs, SUBSET_SIZE)
+} else {
+  time_IDs <- all_time_IDs
+}
+```
+
+```{r log-returns}
+log_r_stock1 <- list()
+
+for (i in seq_along(time_IDs)) {
+  df <- stock1 %>% filter(time_id == time_IDs[i]) %>% arrange(seconds_in_bucket)
+  price <- df$WAP
+  secs <- df$seconds_in_bucket
+  log_r <- log(price[-1] / price[-length(price)])
+  log_r_stock1[[i]] <- tibble(time = secs[-1], log_return = log_r) %>%
+    mutate(time_bucket = ceiling(time / 30))
+}
+```
+
+```{r realised-volatility}
+comp_vol <- function(x) sqrt(sum(x^2, na.rm = TRUE))
+
+vol <- list()
+for (i in seq_along(time_IDs)) {
+  vol[[i]] <- log_r_stock1[[i]] %>%
+    group_by(time_bucket) %>%
+    summarise(RV = comp_vol(log_return), .groups = "drop")
+}
+```
+
+```{r predictors}
+predictors <- stock1 %>%
+  mutate(
+    num_order = bid_size1 + ask_size1 + bid_size2 + ask_size2,
+    time_bucket = ceiling(seconds_in_bucket / 30)
+  ) %>%
+  select(time_id, time_bucket, WAP, num_order, BAS)
+
+list_reg <- list()
+for (i in seq_along(time_IDs)) {
+  list_reg[[i]] <- predictors %>%
+    filter(time_id == time_IDs[i], time_bucket %in% 1:20) %>%
+    group_by(time_bucket) %>%
+    summarise(
+      price = mean(WAP, na.rm = TRUE),
+      order = mean(num_order, na.rm = TRUE),
+      BAS = mean(BAS, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(time_bucket)
+}
+```
+
+```{r loss-functions}
+qlike <- function(actual, pred) {
+  actual <- pmax(actual, 1e-8)
+  pred <- pmax(pred, 1e-8)
+  mean(actual / pred - log(actual / pred) - 1)
+}
+
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2, na.rm = TRUE))
+```
+
+```{r ridge-lambda-tuning}
+# Select Ridge lambda using the same rolling windows and QLIKE loss as the
+# main evaluation — this avoids the mismatch you'd get from pooled CV
+lambda_vals <- c(0.001, 0.01, 0.1, 0.5, 1)
+tuning_results <- data.frame(lambda = lambda_vals, qlike = NA)
+
+for (l in seq_along(lambda_vals)) {
+  losses <- c()
+
+  for (i in seq_along(time_IDs)) {
+    rv_series <- vol[[i]]$RV
+
+    for (t in 16:19) {
+      actual <- rv_series[t + 1]
+
+      train_df <- list_reg[[i]] %>%
+        filter(time_bucket %in% (t - 15):(t - 1)) %>%
+        select(time_bucket, price, order, BAS) %>%
+        inner_join(
+          tibble(time_bucket = (t - 15):(t - 1),
+                 RV = rv_series[(t - 14):t]),
+          by = "time_bucket"
+        )
+
+      newdata <- list_reg[[i]] %>%
+        filter(time_bucket == t) %>%
+        select(price, order, BAS)
+
+      X_train <- as.matrix(train_df %>% select(price, order, BAS))
+      y_train <- train_df$RV
+
+      fit <- glmnet(X_train, y_train, alpha = 0, lambda = lambda_vals[l])
+      pred <- as.numeric(predict(fit, newx = as.matrix(newdata)))
+
+      losses <- c(losses, qlike(actual, pred))
+    }
+  }
+
+  tuning_results$qlike[l] <- mean(losses)
+}
+
+best_lambda_ridge <- tuning_results$lambda[which.min(tuning_results$qlike)]
+cat("Selected Ridge lambda:", best_lambda_ridge, "\n")
+```
+
+```{r model-setup}
+ewma_lambda <- 0.94  # RiskMetrics standard
+wls_decay <- 0.9
+
+spec_garch <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(1, 1)),
+  distribution.model = "norm"
+)
+
+spec_egarch <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(1, 1)),
+  distribution.model = "norm"
+)
+
+pred_ols <- pred_wls <- pred_ridge <- pred_lasso <- c()
+pred_ewma <- pred_har <- pred_garch <- pred_egarch <- c()
+actuals <- c()
+```
+
+```{r rolling-loop}
+for (i in seq_along(time_IDs)) {
+  rv_series <- vol[[i]]$RV
+  returns_full <- log_r_stock1[[i]]$log_return
+
+  for (t in 16:19) {
+    actual <- rv_series[t + 1]
+    actuals <- c(actuals, actual)
+    rv_floor <- mean(rv_series[(t - 15):t]) * 0.1
+
+    train_df <- list_reg[[i]] %>%
+      filter(time_bucket %in% (t - 15):(t - 1)) %>%
+      select(time_bucket, price, order, BAS) %>%
+      inner_join(
+        tibble(time_bucket = (t - 15):(t - 1),
+               RV = rv_series[(t - 14):t]),
+        by = "time_bucket"
+      )
+
+    newdata <- list_reg[[i]] %>%
+      filter(time_bucket == t) %>%
+      select(price, order, BAS)
+
+    fit_ols <- lm(RV ~ price + order + BAS, data = train_df)
+    pred_ols <- c(pred_ols, pmax(predict(fit_ols, newdata), rv_floor))
+
+    fit_wls <- lm(RV ~ price + order + BAS, data = train_df,
+                  weights = wls_decay ^ seq(nrow(train_df) - 1, 0))
+    pred_wls <- c(pred_wls, pmax(predict(fit_wls, newdata), rv_floor))
+
+    X_train <- as.matrix(train_df %>% select(price, order, BAS))
+    y_train <- train_df$RV
+
+    fit_ridge <- glmnet(X_train, y_train, alpha = 0, lambda = best_lambda_ridge)
+    pred_ridge <- c(pred_ridge, pmax(predict(fit_ridge, newx = as.matrix(newdata)), rv_floor))
+
+    fit_lasso <- glmnet(X_train, y_train, alpha = 1, lambda = 0.01)
+    pred_lasso <- c(pred_lasso, pmax(predict(fit_lasso, newx = as.matrix(newdata)), rv_floor))
+
+    start_idx <- which(log_r_stock1[[i]]$time > (t - 16) * 30)[1]
+    end_idx <- tail(which(log_r_stock1[[i]]$time <= t * 30), 1)
+    returns_window <- returns_full[start_idx:end_idx]
+    returns_window <- returns_window[!is.na(returns_window)]
+
+    sigma2 <- returns_window[1]^2
+    for (r in returns_window[-1]) {
+      sigma2 <- ewma_lambda * sigma2 + (1 - ewma_lambda) * r^2
+    }
+    pred_ewma <- c(pred_ewma, pmax(sqrt(30 * sigma2), rv_floor))
+
+    start_j <- max(6, t - 15)
+    train_lag1 <- train_mean5 <- train_RV <- c()
+    for (j in start_j:(t - 1)) {
+      train_lag1 <- c(train_lag1, rv_series[j])
+      train_mean5 <- c(train_mean5, mean(rv_series[(j - 4):j]))
+      train_RV <- c(train_RV, rv_series[j + 1])
+    }
+    har_df <- data.frame(RV = train_RV, lag1 = train_lag1, mean5 = train_mean5)
+    fit_har <- lm(RV ~ lag1 + mean5, data = har_df)
+    newdata_har <- data.frame(lag1 = rv_series[t], mean5 = mean(rv_series[(t - 4):t]))
+    pred_har <- c(pred_har, pmax(predict(fit_har, newdata_har), rv_floor))
+
+    train_returns <- log_r_stock1[[i]] %>%
+      filter(time > (t - 16) * 30, time <= t * 30) %>%
+      pull(log_return)
+
+    fit_garch <- tryCatch(
+      ugarchfit(spec_garch, data = train_returns, solver = "hybrid"),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_garch)) {
+      pred_garch <- c(pred_garch, NA)
+      pred_egarch <- c(pred_egarch, NA)
+      next
+    }
+
+    fc <- tryCatch(
+      ugarchforecast(fit_garch, n.ahead = 30),
+      error = function(e) NULL
+    )
+    if (is.null(fc)) {
+      pred_garch <- c(pred_garch, NA)
+    } else {
+      pred_garch <- c(pred_garch, pmax(sqrt(sum(sigma(fc)^2)), rv_floor))
+    }
+
+    fit_egarch <- tryCatch(
+      ugarchfit(spec_egarch, data = train_returns, solver = "hybrid"),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_egarch)) {
+      pred_egarch <- c(pred_egarch, NA)
+    } else {
+      fc_e <- tryCatch(
+        ugarchforecast(fit_egarch, n.ahead = 30),
+        error = function(e) NULL
+      )
+      if (is.null(fc_e)) {
+        pred_egarch <- c(pred_egarch, NA)
+      } else {
+        pred_egarch <- c(pred_egarch, pmax(sqrt(sum(sigma(fc_e)^2)), rv_floor))
+      }
+    }
+  }
+}
+```
+
+```{r plot-lambda-tuning}
+ggplot(tuning_results, aes(x = lambda, y = qlike)) +
+  geom_line(colour = "#4f8ef7", linewidth = 0.9) +
+  geom_point(colour = "#4f8ef7", size = 2.5) +
+  geom_point(data = tuning_results[which.min(tuning_results$qlike), ],
+             colour = "#00f5c4", size = 4) +
+  scale_x_log10() +
+  labs(
+    title = "Ridge Lambda Selection",
+    subtitle = "Green point = selected lambda (lowest QLIKE)",
+    x = "Lambda (log scale)",
+    y = "Mean QLIKE"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r results-main}
+key_results <- data.frame(
+  Model = c("Ridge", "EWMA", "HAR", "EGARCH"),
+  QLIKE = c(
+    qlike(actuals, pred_ridge),
+    qlike(actuals, pred_ewma),
+    qlike(actuals, pred_har),
+    qlike(actuals, pred_egarch)
+  ),
+  RMSE = c(
+    rmse(actuals, pred_ridge),
+    rmse(actuals, pred_ewma),
+    rmse(actuals, pred_har),
+    rmse(actuals, pred_egarch)
+  )
+) %>% arrange(QLIKE)
+
+knitr::kable(key_results, digits = 6)
+```
+
+```{r plot-results-bar}
+key_results %>%
+  mutate(Model = reorder(Model, QLIKE)) %>%
+  ggplot(aes(x = QLIKE, y = Model)) +
+  geom_col(fill = "#4f8ef7", alpha = 0.8) +
+  geom_col(data = . %>% slice_min(QLIKE, n = 1), fill = "darkblue", alpha = 0.9) +
+  labs(
+    title = "Model Comparison by QLIKE",
+    x = "QLIKE",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r plot-ridge}
+best_preds_clean <- pred_ridge[!is.na(pred_ridge)]
+actuals_clean <- actuals[!is.na(pred_ridge)]
+
+data.frame(Actual = actuals_clean, Predicted = best_preds_clean) %>%
+  ggplot(aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.8, size = 0.5, colour = "red") +
+  geom_abline(slope = 1, intercept = 0, colour = "darkblue",
+              linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title = "Ridge Regression: predicted vs actual volatility",
+    x = "Actual RV",
+    y = "Predicted RV"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r}
+best_egarch_clean <- pred_egarch[!is.na(pred_egarch)]
+actuals_egarch_clean <- actuals[!is.na(pred_egarch)]
+
+data.frame(Actual = actuals_egarch_clean, Predicted = best_egarch_clean) %>%
+  ggplot(aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.8, size = 0.5, colour = "red") +
+  geom_abline(slope = 1, intercept = 0, colour = "darkblue",
+              linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title = "EGARCH: Predicted vs Actual Volatility",
+    subtitle = "Dashed line = perfect prediction",
+    x = "Actual RV",
+    y = "Predicted RV"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+
+```{r results-all}
+all_results <- data.frame(
+  Model = c("OLS", "WLS", "Ridge", "Lasso", "EWMA", "HAR", "GARCH", "EGARCH"),
+  QLIKE = c(
+    qlike(actuals, pred_ols),
+    qlike(actuals, pred_wls),
+    qlike(actuals, pred_ridge),
+    qlike(actuals, pred_lasso),
+    qlike(actuals, pred_ewma),
+    qlike(actuals, pred_har),
+    qlike(actuals, pred_garch),
+    qlike(actuals, pred_egarch)
+  ),
+  RMSE = c(
+    rmse(actuals, pred_ols),
+    rmse(actuals, pred_wls),
+    rmse(actuals, pred_ridge),
+    rmse(actuals, pred_lasso),
+    rmse(actuals, pred_ewma),
+    rmse(actuals, pred_har),
+    rmse(actuals, pred_garch),
+    rmse(actuals, pred_egarch)
+  )
+) %>% arrange(QLIKE)
+
+knitr::kable(all_results, digits = 6)
+```
+
+```{r plot-all}
+plot_df <- data.frame(
+  Actual = rep(actuals, 8),
+  Predicted = c(pred_ols, pred_wls, pred_ridge, pred_lasso,
+                pred_ewma, pred_har, pred_garch, pred_egarch),
+  Model = rep(c("OLS", "WLS", "Ridge", "Lasso",
+                "EWMA", "HAR", "GARCH", "EGARCH"),
+              each = length(actuals))
+) %>% filter(!is.na(Predicted))
+
+ggplot(plot_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.1, size = 0.3, colour = "#00f5c4") +
+  geom_abline(slope = 1, intercept = 0, colour = "#4f8ef7",
+              linetype = "dashed", linewidth = 0.6) +
+  facet_wrap(~ Model, scales = "free", ncol = 4) +
+  labs(title = "Predicted vs actual RV for all models", x = "Actual RV", y = "Predicted RV") +
+  theme_minimal(base_size = 9)
+```
+
+```{r plot-qlike-dist}
+n_ids <- length(time_IDs)
+n_val <- 4
+
+compute_per_id <- function(preds, acts, n_ids, n_val) {
+  sapply(seq_len(n_ids), function(i) {
+    idx <- ((i - 1) * n_val + 1):(i * n_val)
+    act <- pmax(acts[idx], 1e-8)
+    prd <- pmax(preds[idx], 1e-8)
+    mean(act / prd - log(act / prd) - 1)
+  })
+}
+
+boxplot_df <- data.frame(
+  QLIKE = c(compute_per_id(pred_ridge, actuals, n_ids, n_val),
+            compute_per_id(pred_egarch, actuals, n_ids, n_val)),
+  Model = rep(c("Ridge", "EGARCH"), each = n_ids)
+)
+
+ggplot(boxplot_df, aes(x = QLIKE, y = Model, fill = Model)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.8, outlier.alpha = 0.4) +
+  scale_fill_manual(values = c("Ridge" = "#00f5c4", "EGARCH" = "#4f8ef7")) +
+  labs(title = "QLIKE distribution for Ridge and EGARCH", x = "QLIKE", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
